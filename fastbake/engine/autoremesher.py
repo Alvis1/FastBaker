@@ -97,7 +97,9 @@ def read_obj(path):
         for line in f:
             if line.startswith("v "):
                 parts = line.split()
-                verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                if len(parts) >= 4:  # skip a truncated final line
+                    verts.append((float(parts[1]), float(parts[2]),
+                                  float(parts[3])))
             elif line.startswith("f "):
                 idx = []
                 for part in line.split()[1:]:
@@ -130,6 +132,11 @@ class AutoRemesherJob:
         self._stderr = None
 
     def start(self, obj, target_quads, sharp_edge):
+        # Remove stale outputs from a previous attempt (a gate Redo reuses
+        # the same tmpdir) so succeeded() only sees this run's file.
+        for path in (self.out_path, self.report_path):
+            if os.path.isfile(path):
+                os.remove(path)
         tris = write_obj(obj, self.in_path)
         self.expected = max(10.0, tris / 20000.0)
         args = [self.exe,
@@ -140,9 +147,12 @@ class AutoRemesherJob:
                 "--sharp-edge", "%.1f" % sharp_edge,
                 "--adaptivity", "1.0"]
         env = os.environ.copy()
-        if (sys.platform.startswith("linux")
-                and not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY")):
-            env["QT_QPA_PLATFORM"] = "offscreen"
+        if sys.platform.startswith("linux") and not env.get("QT_QPA_PLATFORM"):
+            # Force offscreen in --background even when DISPLAY is set (a
+            # stale value would block the Qt boot on a dead X server).
+            if (bpy.app.background
+                    or (not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"))):
+                env["QT_QPA_PLATFORM"] = "offscreen"
         self._stdout = open(self.stdout_path, "w")
         self._stderr = open(self.stderr_path, "w")
         self.ctx.log("autoremesher: " + " ".join(args))
@@ -157,6 +167,14 @@ class AutoRemesherJob:
     def progress(self):
         elapsed = time.monotonic() - self.started_at
         return min(0.9, elapsed / self.expected)
+
+    def timed_out(self):
+        """Wall-clock watchdog: True once the process has run far beyond the
+        time estimate — treat as hung, cancel() it and fall back."""
+        if not self.running():
+            return False
+        elapsed = time.monotonic() - self.started_at
+        return elapsed > max(self.expected * 60.0, 900.0)
 
     def succeeded(self):
         return (self.proc is not None and self.proc.returncode == 0

@@ -95,6 +95,13 @@ def _save_16bit_png(img, path):
             settings.color_mode = snap["color_mode"]
         except TypeError:
             pass  # restored format may not accept the stored depth/mode combo
+    # save_render leaves the datablock GENERATED with no filepath, so the
+    # pixels would be lost on .blend save/reload — repoint it at the file
+    # (16-bit PNG round-trips linearly, verified headless on 5.1).
+    colorspace = img.colorspace_settings.name
+    img.filepath_raw = path
+    img.source = "FILE"
+    img.colorspace_settings.name = colorspace  # keep Non-Color after repoint
 
 
 class PackStage(Stage):

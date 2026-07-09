@@ -2,8 +2,6 @@
 # write the provenance manifest, stash the originals in FastBake_Sources,
 # remove the scaffold object and hand the result to the user.
 
-import hashlib
-import json
 from datetime import datetime
 
 import bpy
@@ -14,15 +12,13 @@ from .context import Stage, StageError
 SOURCES_COLLECTION = "FastBake_Sources"
 
 
-def _settings_hash(settings, src_names):
-    """Deterministic hash of the settings snapshot + source object names.
+# The manifest hash MUST match the staleness check in preflight — single
+# source of truth lives there.
+from .preflight import settings_hash as _settings_hash_fn
 
-    Must stay in sync with the staleness check in preflight (already-baked
-    detection compares against the manifest's settings_hash).
-    """
-    payload = {"settings": settings, "sources": sorted(src_names)}
-    data = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha1(data).hexdigest()
+
+def _settings_hash(settings, src_names):
+    return _settings_hash_fn(settings, src_names)
 
 
 class MaterialStage(Stage):
@@ -138,17 +134,21 @@ class MaterialStage(Stage):
 
     def _stash_sources(self, ctx):
         scene = bpy.context.scene
-        coll = bpy.data.collections.get(SOURCES_COLLECTION)
+        # (name, library) key: only a LOCAL collection may be the stash — a
+        # library-linked collection with the same name must not be matched
+        coll = bpy.data.collections.get((SOURCES_COLLECTION, None))
         if coll is None:
             coll = bpy.data.collections.new(SOURCES_COLLECTION)
-        if coll.name not in {c.name for c in scene.collection.children_recursive}:
+        # identity check: a linked collection sharing the name must not make
+        # us skip linking the local stash into the scene
+        if not any(c is coll for c in scene.collection.children_recursive):
             scene.collection.children.link(coll)
 
         for name in ctx.src_names:
             src = ctx.obj(name)
             if src is None:
                 continue
-            if src.name not in coll.objects:
+            if not any(o is src for o in coll.objects):
                 coll.objects.link(src)
             for other in list(src.users_collection):
                 if other is not coll:
@@ -168,6 +168,11 @@ class MaterialStage(Stage):
                 % (len(ctx.src_names), SOURCES_COLLECTION))
 
     def _remove_work_object(self, ctx):
+        # retopo keeps the scaffold mesh datablock alive for gate Redo; free
+        # it now that the pipeline is committed to this result
+        kept = bpy.data.meshes.get(ctx.flags.get("retopo_kept_mesh", ""))
+        if kept is not None and kept.users == 0:
+            bpy.data.meshes.remove(kept)
         work = ctx.obj(ctx.work_name)
         if work is None:
             return

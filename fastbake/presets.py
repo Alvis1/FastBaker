@@ -69,9 +69,15 @@ def ensure_factory_presets():
             json.dump(data, f, indent=2)
 
 
+# bpy requires Python to keep a reference to the strings returned by an
+# EnumProperty items callback, or Blender may misbehave or even crash.
+_enum_item_cache = []
+
+
 def _preset_items(self, context):
     items = [(n, n, "") for n in list_presets()]
-    return items or [("NONE", "No presets", "")]
+    _enum_item_cache[:] = items or [("NONE", "No presets", "")]
+    return _enum_item_cache
 
 
 class FASTBAKE_OT_preset_save(bpy.types.Operator):

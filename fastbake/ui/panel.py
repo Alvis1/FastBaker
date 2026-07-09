@@ -36,10 +36,14 @@ class FASTBAKE_OT_confirm_rebake(bpy.types.Operator):
     bl_idname = "fastbake.confirm_rebake"
     bl_label = "Already baked"
     bl_description = "This selection was already processed"
+    bl_options = {"INTERNAL"}
 
     def invoke(self, context, event):
         from ..pipeline import preflight
-        ctx, _err = preflight.make_context(context)
+        ctx, err = preflight.make_context(context)
+        if err:
+            self.report({"ERROR"}, err)
+            return {"CANCELLED"}
         self._msg = ctx.flags.get("already_baked", "Already baked.")
         return context.window_manager.invoke_props_dialog(self, confirm_text="Bake Again")
 

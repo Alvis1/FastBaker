@@ -84,7 +84,10 @@ def settings_to_dict(settings):
 def dict_to_settings(d, settings):
     for k in _SNAP_KEYS:
         if k in d:
-            setattr(settings, k, d[k])
+            try:
+                setattr(settings, k, d[k])
+            except (TypeError, ValueError):
+                pass  # tolerate presets from other versions
     adv = d.get("advanced", {})
     for k in _SNAP_ADV:
         if k in adv:

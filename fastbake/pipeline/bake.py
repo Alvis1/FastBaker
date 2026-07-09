@@ -48,6 +48,10 @@ class BakeStage(Stage):
     gate = True
     adjust_props = ("margin_px", "ssaa", "normal_y")
 
+    # safe defaults in case cancel()/poll() is reached before start()
+    _finished = True
+    _cleaned = True
+
     # -- lifecycle -------------------------------------------------------------
 
     def start(self, ctx):
@@ -57,6 +61,7 @@ class BakeStage(Stage):
         self._cleaned = False
         self._map_done_flag = False
         self._map_cancel_flag = False
+        self._seen_running = False
         self._map_started_at = 0.0
         self._handlers_installed = False
         self._h_complete = None
@@ -93,7 +98,10 @@ class BakeStage(Stage):
         self._big = tex * ssaa
         self._tex = tex
         self._ssaa = ssaa
-        self._margin = int(adv["margin_px"] * tex / 1024)
+        # margin dilates in pixels of the SSAA bake image, so scale it by the
+        # bake resolution: it then survives the pack stage's downscale as
+        # margin_px per 1K of the final texture
+        self._margin = int(adv["margin_px"] * self._big / 1024)
         self._normal_g = "NEG_Y" if adv["normal_y"] == "DIRECTX" else "POS_Y"
         # pseudo-progress: rough per-map duration guess, scales with pixel count
         self._est_secs = max(4.0, 8.0 * (self._big / 2048.0) ** 2)
@@ -145,7 +153,13 @@ class BakeStage(Stage):
 
         n = len(self._maps)
         elapsed = time.time() - self._map_started_at
-        if self._map_done_flag or (not compat.bake_job_running() and elapsed > 1.0):
+        running = compat.bake_job_running()
+        if running:
+            self._seen_running = True
+        # the job may start suspended (another render-lock job is active), so
+        # "not running" only means done once the job was actually seen running
+        if self._map_done_flag or (self._seen_running and not running
+                                   and elapsed > 1.0):
             key = self._maps[self._index]
             self._post_map(ctx, key)
             ctx.log("baked %s map" % key)
@@ -156,12 +170,23 @@ class BakeStage(Stage):
                 return None
             self._launch_map(ctx, self._index)
             return self._index / n
+        if not self._seen_running and elapsed > 30.0:
+            raise StageError("Bake job failed to start (%s map)"
+                             % self._maps[self._index])
 
         guess = min(0.9, elapsed / self._est_secs)
         return (self._index + guess) / n
 
     def cancel(self, ctx):
-        # no API to abort a running bake job; restore what we can
+        # there is no API to abort a running bake job — wait briefly so
+        # cleanup (and the caller's rollback) does not pull the scene,
+        # materials and images from under Cycles
+        if not self._finished:
+            t0 = time.time()
+            while compat.bake_job_running() and time.time() - t0 < 3.0:
+                time.sleep(0.1)
+            if compat.bake_job_running():
+                ctx.log("bake: bake job still running at cancel")
         self._cleanup(ctx)
 
     def summary(self, ctx):
@@ -191,15 +216,19 @@ class BakeStage(Stage):
 
     def _measure_ray_distances(self, ctx, sources, result):
         """Max distance from result vertices to the nearest source surface;
-        x1.5 -> cage_extrusion, x2 -> max_ray_distance."""
+        x1.5 -> cage_extrusion. Rays start from the surface inflated outward
+        by cage_extrusion and are traced inward, so max_ray_distance must
+        cover extrusion + gap: cage + 2x distance (a plain 2x misses)."""
         deps = bpy.context.evaluated_depsgraph_get()
         deps.update()
         trees = []
         for src in sources:
             try:
-                # BVHTree.FromObject builds in the object's local space
+                # BVHTree.FromObject builds in the object's local space; keep
+                # matrix_world so hit points can be measured in world units
                 trees.append((BVHTree.FromObject(src, deps),
-                              src.matrix_world.inverted()))
+                              src.matrix_world.inverted(),
+                              src.matrix_world.copy()))
             except Exception as exc:
                 ctx.log("bake: BVH build failed for %s: %s" % (src.name, exc))
         if not trees:
@@ -210,14 +239,20 @@ class BakeStage(Stage):
         for v in result.data.vertices:
             world = mw @ v.co
             best = None
-            for tree, inv in trees:
-                loc, _nrm, _idx, dist = tree.find_nearest(inv @ world)
-                if loc is not None and (best is None or dist < best):
-                    best = dist
+            for tree, inv, src_mw in trees:
+                loc, _nrm, _idx, _dist = tree.find_nearest(inv @ world)
+                if loc is None:
+                    continue
+                # find_nearest's dist is local-space; measure the hit in world
+                # space (cage_extrusion/max_ray_distance are world units), so
+                # parent/inherited scale cannot skew the extrusion
+                d = ((src_mw @ loc) - world).length
+                if best is None or d < best:
+                    best = d
             if best is not None and best > max_d:
                 max_d = best
         self._cage = max(max_d * 1.5, 1e-4)
-        self._ray = max(max_d * 2.0, 1e-4)
+        self._ray = max(self._cage + max_d * 2.0, 1e-4)
         ctx.log("bake: surface distance %.5f -> extrusion %.5f, ray %.5f"
                 % (max_d, self._cage, self._ray))
 
@@ -328,9 +363,21 @@ class BakeStage(Stage):
 
     def _launch_map(self, ctx, index):
         key = self._maps[index]
+        # the viewport stays interactive between maps: re-assert the bake
+        # selection so a user click cannot redirect the bake (and use_clear)
+        # onto their own objects/images
+        result = ctx.obj(ctx.result_name)
+        if result is None or result.type != "MESH":
+            raise StageError("Bake: result mesh is missing")
+        sources = [ctx.obj(n) for n in ctx.src_names]
+        sources = [o for o in sources if o is not None and o.type == "MESH"]
+        if not sources:
+            raise StageError("Bake: no source objects left to bake from")
+        self._select_for_bake(sources, result)
         self._pre_map(ctx, key)
         self._map_done_flag = False
         self._map_cancel_flag = False
+        self._seen_running = False
         try:
             ret = bpy.ops.object.bake("INVOKE_DEFAULT",
                                       **self._bake_args(ctx, key))

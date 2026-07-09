@@ -35,7 +35,11 @@ def register():
 def unregister():
     import bpy
     from . import props
+    from .pipeline import driver
     from .ui import hud
+    # stop a running pipeline (cancel stage/subprocess, remove the modal
+    # timer, roll back) before its operator classes are unregistered
+    driver.shutdown()
     hud.disable()
     props.unregister()
     for mod in reversed(_modules()):

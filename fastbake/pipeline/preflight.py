@@ -11,6 +11,7 @@ import math
 import os
 
 import bpy
+from mathutils import Matrix, Quaternion, Vector
 
 from .. import naming
 from ..compat import temp_override
@@ -31,15 +32,28 @@ def _flat_items(d, prefix=""):
     return lines
 
 
+# Settings that never change what BAKE produces: review pauses are UI-only
+# and the lm_* values only drive the separate Lightmap pipeline (which writes
+# no manifest). Hashing them would make the already-baked guard silently stop
+# firing after unrelated UI toggles.
+_HASH_IGNORE = frozenset((
+    "review_stages",
+    "advanced.lm_size", "advanced.lm_samples",
+    "advanced.lm_gamma", "advanced.lm_denoise",
+))
+
+
 def settings_hash(settings, src_names):
     """Stable sha1 over the settings snapshot + source identity.
 
     The material stage writes this into the result's "fastbake" manifest;
     make_context compares against it to detect an unchanged re-bake. Source
     identity = sorted names + per-source (vertex count, poly count), so
-    editing a source invalidates the prior result.
+    editing a source invalidates the prior result. Output-irrelevant keys
+    (_HASH_IGNORE) are excluded so UI-only toggles don't defeat the guard.
     """
-    lines = _flat_items(settings)
+    lines = [ln for ln in _flat_items(settings)
+             if ln.split("=", 1)[0] not in _HASH_IGNORE]
     for name in sorted(src_names):
         obj = bpy.data.objects.get(name)
         me = obj.data if obj is not None and obj.type == "MESH" else None
@@ -124,6 +138,25 @@ def make_context(context):
         n = _count_textures(result_obj, manifest)
         ctx.flags["already_baked"] = "%s with %d texture%s already exists" % (
             result_obj.name, n, "" if n == 1 else "s")
+    return ctx, None
+
+
+def make_lightmap_context(context):
+    """Build a PipelineContext for the Lightmap operator.
+
+    The lightmap bakes the ACTIVE object only — exactly what the operator's
+    poll and description advertise — so it must not go through make_context's
+    selection-based fallback (which can silently substitute another object
+    when the active one is unselected).
+    """
+    obj = context.active_object
+    if obj is None or obj.type != "MESH":
+        return None, "Make a mesh object active to bake a lightmap."
+    settings = settings_to_dict(context.scene.fastbake)
+    ctx = PipelineContext(settings, [obj.name], obj.name)
+    ctx.base = naming.base_name(obj.name)
+    ctx.run = naming.next_run(ctx.base, _existing_names(ctx),
+                              settings["advanced"]["naming_style"])
     return ctx, None
 
 
@@ -224,6 +257,37 @@ def _needs_apply(obj):
     return angle > 1e-6
 
 
+def _transform_restore_hook(ctx, obj_name, pristine_name, rename_to,
+                            rot, scale, drot, dscale):
+    """Closure for ctx.undo_hooks: put back the pristine mesh datablock and
+    the rotation/scale values ApplyTransformsStage baked into the vertices,
+    so cancel/error rollback does not keep silently mutated sources.
+    Captures names + plain tuples only (never bpy IDs)."""
+    def restore():
+        obj = bpy.data.objects.get(obj_name)
+        pristine = bpy.data.meshes.get(pristine_name)
+        if obj is not None and pristine is not None and obj.data != pristine:
+            applied = obj.data
+            obj.data = pristine
+            if applied is not None and applied.users == 0:
+                bpy.data.meshes.remove(applied)
+            if rename_to:
+                pristine.name = rename_to
+        if rename_to:
+            # the single-user backup is live mesh data now, not an orphan
+            backups = ctx.flags.get("transform_backups")
+            if backups and pristine_name in backups:
+                backups.remove(pristine_name)
+        if obj is not None:
+            loc = obj.matrix_basis.to_translation()  # location was never applied
+            obj.matrix_basis = (Matrix.Translation(loc)
+                                @ Quaternion(rot).to_matrix().to_4x4()
+                                @ Matrix.Diagonal(Vector(scale).to_4d()))
+            obj.delta_rotation_euler = drot
+            obj.delta_scale = dscale
+    return restore
+
+
 class ApplyTransformsStage(Stage):
     stage_id = "transforms"
     label = "Applying transforms"
@@ -238,12 +302,27 @@ class ApplyTransformsStage(Stage):
             return
 
         for obj in sources:
+            _loc, rot, scale = obj.matrix_basis.decompose()
+            drot = tuple(obj.delta_rotation_euler)
+            dscale = tuple(obj.delta_scale)
+            rename_to = None
             # transform_apply refuses multi-user data; copy keeps other
             # users of the shared mesh untouched.
             if obj.data.users > 1:
+                pristine = obj.data
                 obj.data = obj.data.copy()
                 ctx.notice("Made mesh data single-user on %s to apply its "
                            "transforms." % obj.name)
+            else:
+                # single-user data is mutated in place: keep a pristine
+                # zero-user backup so rollback can put the geometry back
+                pristine = obj.data.copy()
+                rename_to = obj.data.name
+                ctx.flags.setdefault("transform_backups", []).append(
+                    pristine.name)
+            ctx.undo_hooks.append(_transform_restore_hook(
+                ctx, obj.name, pristine.name, rename_to,
+                tuple(rot), tuple(scale), drot, dscale))
 
         if bpy.context.mode != "OBJECT":
             try:

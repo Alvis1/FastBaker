@@ -38,6 +38,9 @@ class PipelineContext:
                                                # engine_used, lightmap (dict), ...
         self.notices = []                      # user-facing notes for the completion report
         self.report_lines = []                 # log
+        self.undo_hooks = []                   # callables run (in reverse) by driver rollback
+                                               # to restore state rollback_to can't (e.g. the
+                                               # transforms applied to source originals)
         self.tmpdir = tempfile.mkdtemp(prefix="fastbake_")
 
     # -- helpers -------------------------------------------------------------
@@ -68,8 +71,8 @@ class PipelineContext:
     def output_dir(self):
         raw = self.settings["advanced"]["output_dir"] or "//textures/"
         path = bpy.path.abspath(raw)
-        if not path or path.startswith("//"):
-            # unsaved .blend and relative path: fall back to temp
+        if not path or not os.path.isabs(path):
+            # unsaved .blend with a //relative path: fall back to temp
             path = os.path.join(self.tmpdir, "textures")
         os.makedirs(path, exist_ok=True)
         return path

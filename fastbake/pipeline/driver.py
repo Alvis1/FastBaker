@@ -2,11 +2,14 @@
 # Blender, a plain blocking loop in background mode (headless tests).
 # Consumes the stage queue in pipeline.state.STATE.
 
+import os
+import shutil
 import time
 import traceback
 
 import bpy
 
+from .. import compat
 from . import state
 from .context import StageError
 from .state import STATE
@@ -35,7 +38,7 @@ def launch(context, stages, ctx):
     if STATE["running"]:
         return False
     state.reset()
-    STATE.update(running=True, stages=stages, ctx=ctx, error=None)
+    STATE.update(running=True, stages=stages, ctx=ctx, error=None, cancel_wait=0)
     _set_labels()
     if bpy.app.background:
         _run_blocking()
@@ -48,7 +51,11 @@ def launch(context, stages, ctx):
 def _set_labels():
     stages = STATE["stages"]
     i = STATE["index"]
-    if i < len(stages):
+    if STATE["waiting"] and i > 0:
+        # parked at a review gate: the next stage has not started yet
+        STATE["message"] = "PAUSED"
+        STATE["detail"] = "review %s" % stages[i - 1].stage_id
+    elif i < len(stages):
         STATE["message"] = stages[i].label.upper()
         STATE["detail"] = "stage %d/%d" % (i + 1, len(stages))
     STATE["overall"] = state.compute_overall()
@@ -84,6 +91,13 @@ def _step():
     stages = STATE["stages"]
 
     if STATE["cancel"]:
+        # A running Cycles bake job cannot be aborted from Python; freeing
+        # its target datablocks mid-job is a use-after-free. Defer the
+        # cancel/rollback until the job drains (bounded: ~300 ticks, i.e.
+        # ~30 s at the 0.1 s timer rate).
+        if compat.bake_job_running() and STATE.get("cancel_wait", 0) < 300:
+            STATE["cancel_wait"] = STATE.get("cancel_wait", 0) + 1
+            return "RUNNING"
         if STATE["started"] and STATE["index"] < len(stages):
             try:
                 stages[STATE["index"]].cancel(ctx)
@@ -149,20 +163,29 @@ def _step():
     review = ctx.settings.get("review_stages") and stage.gate and not bpy.app.background
     STATE["index"] += 1
     STATE["started"] = False
-    if STATE["index"] < len(stages):
-        _set_labels()
+    # the next stage has not run yet: without this reset compute_overall()
+    # counts it as 100% done while parked at a gate (progress overshoot)
+    STATE["stage_progress"] = 0.0
     if review:
         STATE["waiting"] = True
         STATE["gate_summary"] = stage.summary(ctx)
+        _set_labels()
         return "WAITING"
     if STATE["index"] >= len(stages):
         _finish(ctx)
         return "DONE"
+    _set_labels()
     return "RUNNING"
 
 
 def _rollback(ctx, why):
     ctx.log("rollback: " + why)
+    for hook in reversed(ctx.undo_hooks):
+        try:
+            hook()
+        except Exception:
+            ctx.log(traceback.format_exc())
+    ctx.undo_hooks.clear()
     ctx.rollback_to((0, 0, 0))
     _restore_sources(ctx)
     _teardown(why)
@@ -184,6 +207,13 @@ def _fail(ctx, message):
 
 
 def _finish(ctx):
+    # transform-restore backups are only needed for rollback; a successful
+    # run no longer can roll back, so free the zero-user mesh copies
+    for name in ctx.flags.get("transform_backups", ()):
+        me = bpy.data.meshes.get(name)
+        if me is not None and me.users == 0:
+            bpy.data.meshes.remove(me)
+    ctx.undo_hooks.clear()
     _teardown("done")
     if bpy.app.background:
         return
@@ -207,6 +237,7 @@ def _teardown(why):
     STATE["running"] = False
     STATE["waiting"] = False
     STATE["message"] = ""
+    _remove_tmpdir(STATE["ctx"])
     if not bpy.app.background:
         from ..ui import hud
         hud.disable()
@@ -214,11 +245,59 @@ def _teardown(why):
         state.tag_redraw()
 
 
+def _remove_tmpdir(ctx):
+    """Delete the per-run temp dir (OBJ dumps, denoise EXR, logs).
+
+    Called only on final teardown (done/cancelled/error), never between
+    stages — the lightmap stage keeps temp EXRs there mid-run. Skipped when
+    the run's saved textures live inside it (unsaved .blend: output_dir()
+    falls back to <tmpdir>/textures)."""
+    if ctx is None or not getattr(ctx, "tmpdir", None):
+        return
+    tmp = os.path.realpath(ctx.tmpdir)
+    for path in ctx.files.values():
+        if os.path.realpath(path).startswith(tmp + os.sep):
+            return
+    shutil.rmtree(ctx.tmpdir, ignore_errors=True)
+
+
 def _error_popup(message):
     def draw(menu, _context):
         menu.layout.label(text=message)
 
     bpy.context.window_manager.popup_menu(draw, title="FastBake failed", icon="ERROR")
+
+
+def _remove_timer():
+    timer = STATE.pop("timer", None)
+    if timer is None:
+        return
+    try:
+        bpy.context.window_manager.event_timer_remove(timer)
+    except Exception:
+        pass
+
+
+def shutdown():
+    """Stop a running pipeline. Called by the add-on's unregister() so that
+    disabling/updating FastBake mid-run cancels the current stage (which
+    terminates any AutoRemesher subprocess), rolls back and resets module
+    state — otherwise the window timer leaks and STATE['running'] stays True
+    across a re-enable."""
+    if STATE["running"]:
+        ctx = STATE["ctx"]
+        stages = STATE["stages"]
+        if ctx is not None and STATE["started"] and STATE["index"] < len(stages):
+            try:
+                stages[STATE["index"]].cancel(ctx)
+            except Exception:
+                pass
+        if ctx is not None:
+            _rollback(ctx, "add-on disabled")
+        else:
+            _teardown("add-on disabled")
+    _remove_timer()
+    state.reset()
 
 
 def _run_blocking():
@@ -248,12 +327,20 @@ class FASTBAKE_OT_run_pipeline(bpy.types.Operator):
     def invoke(self, context, event):
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.1, window=context.window)
+        # module-level reference so shutdown() (add-on disable) can remove
+        # the timer without the operator instance
+        STATE["timer"] = self._timer
         wm.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
         if event.type == "ESC":
             STATE["cancel"] = True
+        # Swallow undo/redo while the pipeline owns the scene: ed.undo would
+        # delete run datablocks mid-stage or at a review gate. macOS undo is
+        # Cmd+Z (oskey), Ctrl covers Ctrl+Z / Ctrl+Shift+Z elsewhere.
+        if event.type == "Z" and (event.ctrl or event.oskey):
+            return {"RUNNING_MODAL"}
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
 
@@ -264,7 +351,7 @@ class FASTBAKE_OT_run_pipeline(bpy.types.Operator):
             return {"PASS_THROUGH"}
 
         # DONE / CANCELLED / ERROR
-        context.window_manager.event_timer_remove(self._timer)
+        _remove_timer()
         if result == "CANCELLED":
             self.report({"WARNING"}, "FastBake cancelled")
             return {"CANCELLED"}
