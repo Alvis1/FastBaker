@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "fastbake"
+version = "0.1.0"
+name = "FastBake"
+tagline = "One click from high-poly to a baked, game-ready quad asset"
+maintainer = "Alvis Misjuns <alvismisjuns@gmail.com>"
+type = "add-on"
+
+website = "https://github.com/alvismisjuns/fastbake"
+
+blender_version_min = "4.5.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = [
+  "2026 Alvis Misjuns",
+  "2026 Dust3D Project (AutoRemesher, MIT)",
+]
+
+tags = ["Bake", "Mesh", "UV", "Material"]
+
+[permissions]
+files = "Write baked textures and temporary meshes to disk"
