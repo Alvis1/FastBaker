@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Blender
+*.blend1
+*.blend2
+
+# local wheel builds / scratch
+wheelhouse/
+build/

@@ -1,15 +1,50 @@
 # Material stage: build the final Principled material from the saved textures,
 # write the provenance manifest, stash the originals in FastBake_Sources,
 # remove the scaffold object and hand the result to the user.
+#
+# What the color texture's alpha channel drives depends on what pack put there
+# (plan §2 ruling): roughness when it was packed, the source's own alpha when
+# the sources had one — that case also switches the material's render method
+# so the transparency is actually visible. Every bpy.data lookup here is
+# local-only (_local): a library-linked datablock sharing a name is not ours.
 
 from datetime import datetime
 
 import bpy
 
-from .. import naming
 from .context import Stage, StageError
 
 SOURCES_COLLECTION = "FastBake_Sources"
+
+
+def _local(collection, name):
+    """bpy.data lookup restricted to LOCAL datablocks.
+
+    Every name FastBake resolves is one it created in this file; a
+    library-linked datablock that happens to share the name must never be
+    picked up (it is read-only and belongs to someone else's asset).
+    """
+    return collection.get((name, None)) if name else None
+
+
+def _set_alpha_render_method(mat):
+    """Make the material actually show its alpha.
+
+    4.2+/5.x: Material.surface_render_method ('BLENDED' for correct
+    semi-transparency, 'DITHERED' where the enum has no BLENDED). Older
+    builds: the legacy EEVEE blend_method. Feature-detected, never a
+    bpy.app.version branch (dev/CONTRACTS.md rule 4).
+    """
+    if hasattr(mat, "surface_render_method"):
+        try:
+            mat.surface_render_method = "BLENDED"
+        except TypeError:
+            mat.surface_render_method = "DITHERED"
+    elif hasattr(mat, "blend_method"):
+        try:
+            mat.blend_method = "BLEND"
+        except TypeError:
+            pass
 
 
 # The manifest hash MUST match the staleness check in preflight — single
@@ -42,7 +77,7 @@ class MaterialStage(Stage):
         for name in old_names:
             if name == mat.name or name not in ctx.created_materials:
                 continue
-            old = bpy.data.materials.get(name)
+            old = _local(bpy.data.materials, name)
             if old and old.users == 0:
                 bpy.data.materials.remove(old)
 
@@ -54,7 +89,7 @@ class MaterialStage(Stage):
     # -- helpers ---------------------------------------------------------
 
     def _build_material(self, ctx):
-        mat = bpy.data.materials.new(naming.mat_name(ctx.base, ctx.run))
+        mat = bpy.data.materials.new(ctx.mat_name())
         mat.use_nodes = True
         tree = mat.node_tree
 
@@ -75,8 +110,9 @@ class MaterialStage(Stage):
             tree.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
         packed = bool(ctx.flags.get("roughness_packed"))
+        source_alpha = bool(ctx.flags.get("source_alpha_packed"))
 
-        color = bpy.data.images.get(ctx.images.get("color", ""))
+        color = _local(bpy.data.images, ctx.images.get("color", ""))
         if color:
             node = tree.nodes.new("ShaderNodeTexImage")
             node.image = color
@@ -86,9 +122,16 @@ class MaterialStage(Stage):
             if packed:
                 # roughness lives in the color alpha (CHANNEL_PACKED)
                 tree.links.new(node.outputs["Alpha"], bsdf.inputs["Roughness"])
+            elif source_alpha:
+                # plan §2 ruling: the source's own alpha owns the channel —
+                # wire it back to Alpha so the cutout survives the round trip
+                alpha_in = bsdf.inputs.get("Alpha")
+                if alpha_in is not None:
+                    tree.links.new(node.outputs["Alpha"], alpha_in)
+                    _set_alpha_render_method(mat)
 
         if not packed:
-            rough = bpy.data.images.get(ctx.images.get("roughness", ""))
+            rough = _local(bpy.data.images, ctx.images.get("roughness", ""))
             if rough:
                 node = tree.nodes.new("ShaderNodeTexImage")
                 node.image = rough
@@ -96,7 +139,7 @@ class MaterialStage(Stage):
                 node.location = (-460, 0)
                 tree.links.new(node.outputs["Color"], bsdf.inputs["Roughness"])
 
-        normal = bpy.data.images.get(ctx.images.get("normal", ""))
+        normal = _local(bpy.data.images, ctx.images.get("normal", ""))
         if normal:
             node = tree.nodes.new("ShaderNodeTexImage")
             node.image = normal
@@ -170,7 +213,7 @@ class MaterialStage(Stage):
     def _remove_work_object(self, ctx):
         # retopo keeps the scaffold mesh datablock alive for gate Redo; free
         # it now that the pipeline is committed to this result
-        kept = bpy.data.meshes.get(ctx.flags.get("retopo_kept_mesh", ""))
+        kept = _local(bpy.data.meshes, ctx.flags.get("retopo_kept_mesh", ""))
         if kept is not None and kept.users == 0:
             bpy.data.meshes.remove(kept)
         work = ctx.obj(ctx.work_name)

@@ -1,6 +1,10 @@
 # Module-level pipeline state. Lives outside any operator instance so it
 # survives redraws and is inspectable by the panel. Only one pipeline can run
 # at a time.
+#
+# NOTE: this module also survives a file load, which is why the driver
+# installs a load_pre handler and a modal cancel() callback — a stale
+# "running" here would lock the panel for the rest of the session.
 
 STATE = {
     "running": False,
@@ -15,8 +19,11 @@ STATE = {
     "waiting": False,      # parked at a review gate
     "gate_summary": "",    # summary text shown at the gate
     "cancel": False,       # cancel requested
+    "cancel_wait": 0,      # ticks spent waiting for a Cycles job to drain
+    "draining": False,     # cancelled, waiting out a running bake job
     "redo": False,         # redo of current stage requested
     "error": None,         # user-facing error string after failure
+    "log_text": None,      # name of the Text datablock holding the run log
 }
 
 # Relative durations for the overall progress bar.
@@ -27,9 +34,12 @@ STAGE_WEIGHTS = {
 
 
 def reset():
+    """Back to idle. `error`/`log_text` survive on purpose — the panel shows
+    the last failure until the next run starts (launch clears them)."""
     STATE.update(running=False, stages=[], index=0, started=False, ctx=None,
                  stage_progress=0.0, overall=0.0, message="", detail="",
-                 waiting=False, gate_summary="", cancel=False, redo=False)
+                 waiting=False, gate_summary="", cancel=False, cancel_wait=0,
+                 draining=False, redo=False)
 
 
 def compute_overall():

@@ -1,17 +1,23 @@
 schema_version = "1.0.0"
 
 id = "fastbake"
-version = "0.1.0"
+version = "0.2.1"
 name = "FastBake"
 tagline = "One click from high-poly to a baked, game-ready quad asset"
 maintainer = "Alvis Misjuns <alvismisjuns@gmail.com>"
 type = "add-on"
 
-website = "https://github.com/alvismisjuns/fastbake"
+website = "https://github.com/Alvis1/FastBaker"
 
 blender_version_min = "4.5.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
+# This is the universal (QuadriFlow-only) build: it bundles no binaries, so
+# only FastBake's own code and the AutoRemesher protocol/IO it speaks are
+# credited here. The platform zips additionally link Geogram (BSD-3), Eigen
+# (MPL-2.0) and TBB (Apache-2.0) into the autoremesher_core wheel; those
+# credits are appended to this list by dev/package_extension.py
+# (WHEEL_COPYRIGHT) when the wheel-bearing zips are built. Plan §9 "License".
 copyright = [
   "2026 Alvis Misjuns",
   "2026 Dust3D Project (AutoRemesher, MIT)",

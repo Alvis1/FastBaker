@@ -11,9 +11,10 @@ import math
 import os
 
 import bpy
+import numpy as np
 from mathutils import Matrix, Quaternion, Vector
 
-from .. import naming
+from .. import naming, prefs
 from ..compat import temp_override
 from ..props import settings_to_dict
 from .context import PipelineContext, Stage, StageError
@@ -43,41 +44,85 @@ _HASH_IGNORE = frozenset((
 ))
 
 
+def _source_digest(obj):
+    """Fingerprint of one source object's geometry + modifier stack.
+
+    Counts alone miss every count-preserving edit (a sculpt stroke without
+    dyntopo, a Grab brush, proportional editing), so the vertex coordinates
+    themselves go into the digest — plan §5 stage 0 promises that "source-mesh
+    edits change the hash and re-enable processing".
+    """
+    me = obj.data if obj is not None and obj.type == "MESH" else None
+    h = hashlib.sha1()
+    if me is None:
+        h.update(b"no-mesh")
+        return h.hexdigest()
+    h.update(("v%d:p%d" % (len(me.vertices), len(me.polygons))).encode("utf-8"))
+    try:
+        co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+        me.vertices.foreach_get("co", co)
+        h.update(co.tobytes())
+    except (AttributeError, RuntimeError, ValueError, MemoryError):
+        pass  # counts-only fallback: never fail a bake over the guard
+    for mod in getattr(obj, "modifiers", ()):
+        h.update(("|%s:%s" % (mod.type, mod.name)).encode("utf-8"))
+    return h.hexdigest()
+
+
 def settings_hash(settings, src_names):
     """Stable sha1 over the settings snapshot + source identity.
 
     The material stage writes this into the result's "fastbake" manifest;
     make_context compares against it to detect an unchanged re-bake. Source
-    identity = sorted names + per-source (vertex count, poly count), so
-    editing a source invalidates the prior result. Output-irrelevant keys
+    identity = sorted names + per-source geometry/modifier digest, so editing
+    a source invalidates the prior result. Output-irrelevant keys
     (_HASH_IGNORE) are excluded so UI-only toggles don't defeat the guard.
     """
     lines = [ln for ln in _flat_items(settings)
              if ln.split("=", 1)[0] not in _HASH_IGNORE]
     for name in sorted(src_names):
-        obj = bpy.data.objects.get(name)
-        me = obj.data if obj is not None and obj.type == "MESH" else None
-        lines.append("src:%s:%d:%d" % (
-            name,
-            len(me.vertices) if me else 0,
-            len(me.polygons) if me else 0))
+        lines.append("src:%s:%s" % (name, _source_digest(bpy.data.objects.get(name))))
     return hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 # --- context construction -----------------------------------------------------
 
+def _local(datablocks):
+    """Only local IDs count toward name collisions (plan §6): linked-library
+    data lives in its own (name, library) namespace and never collides."""
+    return [d for d in datablocks if d.library is None]
+
+
 def _existing_names(ctx):
-    """Names already taken: blend images + materials + output dir file stems."""
-    existing = {img.name for img in bpy.data.images}
-    existing.update(mat.name for mat in bpy.data.materials)
-    try:
-        existing.update(naming.strip_ext(f) for f in os.listdir(ctx.output_dir()))
-    except OSError:
-        pass  # unreachable output dir is reported properly by the stage
+    """Names already taken: blend images + materials + output dir file stems.
+
+    Read-only: the output directory is NOT created here — merely pressing
+    BAKE (or opening the re-bake dialog) must not touch the disk.
+    """
+    existing = {img.name for img in _local(bpy.data.images)}
+    existing.update(mat.name for mat in _local(bpy.data.materials))
+    outdir = ctx.output_path()
+    if outdir:
+        try:
+            existing.update(naming.strip_ext(f) for f in os.listdir(outdir))
+        except OSError:
+            pass  # missing/unreachable output dir is reported by the stage
     return existing
 
 
-def _count_textures(result_obj, manifest):
+def _naming_kwargs(ctx):
+    adv = ctx.settings.get("advanced", {})
+    return dict(style=adv.get("naming_style", "VERBOSE"),
+                template=adv.get("naming_template"),
+                material_template=adv.get("material_template"))
+
+
+def _next_run(ctx, **kwargs):
+    kwargs.update(_naming_kwargs(ctx))
+    return naming.next_run(ctx.base, _existing_names(ctx), **kwargs)
+
+
+def _count_textures(result_obj, manifest, ctx=None):
     """How many of the manifest's baked textures still exist as images."""
     try:
         maps = [str(m) for m in manifest.get("maps", ())]
@@ -85,14 +130,16 @@ def _count_textures(result_obj, manifest):
     except (AttributeError, TypeError, ValueError):
         return 0
     base = naming.base_name(result_obj.name)
+    template = (ctx.settings.get("advanced", {}).get("naming_template")
+                if ctx is not None else None)
     count = 0
     for key in maps:
         for style in naming.MAP_SUFFIX:
             try:
-                name = naming.tex_name(base, key, run, style)
+                name = naming.tex_name(base, key, run, style, template)
             except KeyError:
                 continue  # map key from another version
-            if bpy.data.images.get(name):
+            if bpy.data.images.get((name, None)):   # local images only
                 count += 1
                 break
     return count if count else len(maps)
@@ -101,6 +148,8 @@ def _count_textures(result_obj, manifest):
 def _find_prior_result(scene, settings, src_names):
     want = settings_hash(settings, src_names)
     for obj in scene.objects:
+        if obj.library is not None:
+            continue  # hard rule 10: only local IDs count
         manifest = obj.get("fastbake")
         if manifest is None:
             continue
@@ -113,32 +162,92 @@ def _find_prior_result(scene, settings, src_names):
     return None
 
 
+def _apply_machine_defaults(settings):
+    """Machine-level output root (plan §8) for scenes still on the default."""
+    p = prefs.get_prefs()
+    root = (getattr(p, "output_root", "") or "").strip() if p else ""
+    if root and settings["advanced"].get("output_dir") in ("", "//textures/"):
+        settings["advanced"]["output_dir"] = root
+    return settings
+
+
+def _flag_output_dir(ctx):
+    """Mark an unresolvable output path so the UI can ask for a folder."""
+    if ctx.output_path() is None:
+        ctx.flags["needs_output_dir"] = (
+            "This .blend has not been saved, so //textures/ has no location.")
+    return ctx
+
+
 def make_context(context):
     """Build a PipelineContext from the current selection.
 
     Returns (ctx, None) on success, (None, error_message) when the
     selection is unusable.
     """
-    sources = [o for o in context.selected_objects if o.type == "MESH"]
+    selected = list(context.selected_objects)
+    sources = [o for o in selected if o.type == "MESH"]
+    ignored = [o for o in selected if o.type != "MESH"]
     if not sources:
+        if ignored:
+            return None, "Select a mesh to bake (the selection has no mesh objects)."
         return None, "Select a mesh to bake."
     active = context.active_object
     if active is None or active.type != "MESH" or active not in sources:
         active = sources[0]
 
-    settings = settings_to_dict(context.scene.fastbake)
+    settings = _apply_machine_defaults(settings_to_dict(context.scene.fastbake))
     ctx = PipelineContext(settings, [o.name for o in sources], active.name)
+    if ignored:
+        # plan §5 stage 0: non-mesh objects are ignored WITH A NOTICE
+        shown = ", ".join(o.name for o in ignored[:3])
+        if len(ignored) > 3:
+            shown += ", ..."
+        ctx.notice("Ignored %d non-mesh object(s) in the selection: %s"
+                   % (len(ignored), shown))
     ctx.base = naming.base_name(active.name)
-    ctx.run = naming.next_run(ctx.base, _existing_names(ctx),
-                              settings["advanced"]["naming_style"])
+    ctx.run = _next_run(ctx)
+    _flag_output_dir(ctx)
 
     prior = _find_prior_result(context.scene, settings, ctx.src_names)
     if prior is not None:
         result_obj, manifest = prior
-        n = _count_textures(result_obj, manifest)
+        n = _count_textures(result_obj, manifest, ctx)
         ctx.flags["already_baked"] = "%s with %d texture%s already exists" % (
             result_obj.name, n, "" if n == 1 else "s")
     return ctx, None
+
+
+def _manifest_run(obj):
+    """The run number recorded in a FastBake result's manifest, or None."""
+    manifest = obj.get("fastbake") if obj is not None else None
+    if manifest is None:
+        return None
+    try:
+        return int(manifest.get("run"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def resolve_lightmap_run(ctx, obj):
+    """Run number for a lightmap of `obj` (plan §6 table).
+
+    The lightmap belongs to the bake it lights, so it reuses that run: a
+    first-bake asset gets T_<Base>_lightmap, not _01. Only when the object
+    carries no manifest (a hand-made mesh) does the counter fall back to
+    scanning EXISTING LIGHTMAPS ONLY — the sibling color/normal/material
+    names must not bump it, or the very first lightmap is mis-numbered.
+    """
+    run = _manifest_run(obj)
+    if run is not None and run >= 0:
+        adv = ctx.settings.get("advanced", {})
+        name = naming.tex_name(ctx.base, "lightmap", run,
+                               adv.get("naming_style", "VERBOSE"),
+                               adv.get("naming_template"))
+        if bpy.data.images.get(name) is None:
+            return run
+        # that lightmap already exists: this is a re-light, take a fresh number
+    return _next_run(ctx, maps=("lightmap",), include_material=False)
 
 
 def make_lightmap_context(context):
@@ -152,12 +261,34 @@ def make_lightmap_context(context):
     obj = context.active_object
     if obj is None or obj.type != "MESH":
         return None, "Make a mesh object active to bake a lightmap."
-    settings = settings_to_dict(context.scene.fastbake)
+    settings = _apply_machine_defaults(settings_to_dict(context.scene.fastbake))
     ctx = PipelineContext(settings, [obj.name], obj.name)
     ctx.base = naming.base_name(obj.name)
-    ctx.run = naming.next_run(ctx.base, _existing_names(ctx),
-                              settings["advanced"]["naming_style"])
+    ctx.run = resolve_lightmap_run(ctx, obj)
+    _flag_output_dir(ctx)
     return ctx, None
+
+
+# --- environment ------------------------------------------------------------
+
+def cycles_available():
+    """True when the Cycles render engine add-on is registered.
+
+    Every bake (and the lightmap) is a Cycles job; without it the failure
+    surfaces as an AttributeError on scene.cycles deep inside a stage.
+    """
+    if hasattr(bpy.types.Scene, "cycles"):
+        return True
+    try:
+        if "cycles" in bpy.context.preferences.addons:
+            return True
+    except (AttributeError, KeyError):
+        pass
+    try:
+        items = bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items
+        return "CYCLES" in items.keys()
+    except (AttributeError, KeyError, TypeError):
+        return False
 
 
 # --- material analysis ----------------------------------------------------------
@@ -212,11 +343,21 @@ class PreflightStage(Stage):
     gate = False
 
     def start(self, ctx):
+        # Every stage edits meshes through operators that need Object Mode;
+        # launched from Edit/Sculpt Mode, modifier_apply would decline silently
+        # (open sheets never get solidified) and the run would die at retopo.
+        if bpy.context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except RuntimeError as exc:
+                raise StageError("FastBake needs Object Mode to run (%s)" % exc)
         sources = [o for o in (ctx.obj(n) for n in ctx.src_names) if o is not None]
         if not sources:
             raise StageError("The selected meshes disappeared before the bake started.")
         if sum(len(o.data.polygons) for o in sources) == 0:
             raise StageError("The selected meshes have no faces to bake from.")
+        if not cycles_available():
+            raise StageError("Cycles render engine is not available")
 
         uses_alpha, has_metallic = _analyze_materials(sources)
         ctx.flags["source_uses_alpha"] = uses_alpha
@@ -279,12 +420,18 @@ def _transform_restore_hook(ctx, obj_name, pristine_name, rename_to,
             if backups and pristine_name in backups:
                 backups.remove(pristine_name)
         if obj is not None:
+            # Deltas FIRST: matrix_basis is the object's local matrix WITHOUT
+            # the deltas, but Object.matrix_basis's setter divides the current
+            # delta values out of what it is handed. Restoring the saved rot/
+            # scale while the deltas are still the reset (1,1,1)/(0,0,0) ones
+            # and only then writing the deltas back would apply them twice —
+            # the object would come back at delta² size/orientation.
+            obj.delta_rotation_euler = drot
+            obj.delta_scale = dscale
             loc = obj.matrix_basis.to_translation()  # location was never applied
             obj.matrix_basis = (Matrix.Translation(loc)
                                 @ Quaternion(rot).to_matrix().to_4x4()
                                 @ Matrix.Diagonal(Vector(scale).to_4d()))
-            obj.delta_rotation_euler = drot
-            obj.delta_scale = dscale
     return restore
 
 
@@ -360,12 +507,14 @@ class LightmapPreflightStage(Stage):
                              % obj.name)
         if len(obj.data.polygons) == 0:
             raise StageError("%s has no faces to bake a lightmap onto." % obj.name)
+        if not cycles_available():
+            raise StageError("Cycles render engine is not available")
 
         if not ctx.base:
             # ctx built without make_context: derive naming here
             ctx.base = naming.base_name(obj.name)
-            ctx.run = naming.next_run(ctx.base, _existing_names(ctx),
-                                      ctx.settings["advanced"]["naming_style"])
+        # the lightmap shares the run number of the bake it lights (plan §6)
+        ctx.run = resolve_lightmap_run(ctx, obj)
 
         try:
             outdir = ctx.output_dir()

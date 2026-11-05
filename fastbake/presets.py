@@ -1,7 +1,11 @@
 # JSON preset system: save / load / export / import.
 # Blender's native preset framework stores executable .py files and has no
-# import/export, so FastBake keeps plain JSON in the extension user dir.
+# import/export, so FastBake keeps plain JSON in the extension user dir
+# (plan §8). The schema is the one documented in the plan:
+#   {"fastbake_preset": 1, "name": ..., <settings>,
+#    "naming": {"template", "material", "style"}, "advanced": {...}}
 
+import copy
 import json
 import os
 
@@ -9,15 +13,23 @@ import bpy
 from bpy.props import StringProperty
 
 from . import compat
-from .props import dict_to_settings, settings_to_dict
+from .props import (default_settings_dict, dict_to_settings, naming_block,
+                    settings_to_dict)
 
 PRESET_VERSION = 1
 
+# Factory presets are OVERRIDES on top of the property defaults; the files
+# written from them always contain every key (see ensure_factory_presets).
 FACTORY = {
     "Props 2k": {"quads": 5000, "tex_size": "2048"},
     "Hero 4k": {"quads": 20000, "tex_size": "4096"},
     "Mobile 1k": {"quads": 1500, "tex_size": "1024",
                   "advanced": {"naming_style": "LETTERS"}},
+    # plan §6: "a bundled Unreal preset switches to letter suffixes"
+    # (Epic mandates the T_/M_ prefixes the default templates already use)
+    "Unreal": {"quads": 5000, "tex_size": "2048",
+               "advanced": {"naming_style": "LETTERS",
+                            "normal_y": "DIRECTX"}},
 }
 
 
@@ -25,9 +37,25 @@ def preset_dir():
     return compat.extension_user_dir("presets")
 
 
+def sanitize_name(name):
+    """Filename-safe preset name. The sanitised form IS the preset name —
+    save/load/delete and the list all agree on it."""
+    return "".join(c for c in str(name) if c.isalnum() or c in " _-").strip()
+
+
 def _path(name):
-    safe = "".join(c for c in name if c.isalnum() or c in " _-").strip()
-    return os.path.join(preset_dir(), safe + ".json")
+    directory = preset_dir()
+    filename = "%s.json" % name
+    # a file copied into the presets folder by hand keeps its own spelling:
+    # list_presets() shows that stem, so load/delete must find it again
+    if filename == os.path.basename(filename) and not os.path.isabs(filename):
+        candidate = os.path.join(directory, filename)
+        if os.path.isfile(candidate):
+            return candidate
+    safe = sanitize_name(name)
+    if not safe:
+        raise ValueError("A preset name needs at least one letter or number")
+    return os.path.join(directory, safe + ".json")
 
 
 def list_presets():
@@ -38,35 +66,90 @@ def list_presets():
     return [os.path.splitext(f)[0] for f in files if f.endswith(".json")]
 
 
-def save_preset(name, settings):
+def preset_data(name, settings):
     data = {"fastbake_preset": PRESET_VERSION, "name": name}
     data.update(settings_to_dict(settings))
-    with open(_path(name), "w", encoding="utf-8") as f:
+    data["naming"] = naming_block(data)   # plan §8 schema block
+    return data
+
+
+def write_preset_data(name, data):
+    """Store a preset dict verbatim. Returns (stem, overwrote_existing)."""
+    path = _path(name)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    existed = os.path.isfile(path)
+    data = dict(data)
+    data["fastbake_preset"] = PRESET_VERSION
+    data["name"] = stem
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    return stem, existed
+
+
+def save_preset(name, settings):
+    """Write a preset. Returns (stem, overwrote_existing).
+
+    `stem` is the name the preset is known by afterwards — sanitised, so the
+    caller can report exactly what the user will see in the list.
+    """
+    path = _path(name)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    existed = os.path.isfile(path)
+    data = preset_data(stem, settings)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return stem, existed
 
 
 def load_preset(name, settings):
+    """Apply a preset file. Returns the list of keys that did not apply."""
     with open(_path(name), "r", encoding="utf-8") as f:
         data = json.load(f)
     if data.get("fastbake_preset") != PRESET_VERSION:
         raise ValueError("Unsupported preset version")
-    dict_to_settings(data, settings)
+    return dict_to_settings(data, settings)
+
+
+def factory_preset_data(name):
+    """A COMPLETE preset dict for one factory preset.
+
+    Every setting is written, not just the overrides: dict_to_settings only
+    touches keys that are present, so a partial preset would silently leave
+    the previous preset's values in place (a Mobile 1k -> Props 2k switch
+    keeping letter suffixes, say). FACTORY itself is never mutated — it is
+    deep-copied first, or a second call in the same session (add-on
+    disable/enable) would regenerate a stripped preset.
+    """
+    overrides = copy.deepcopy(FACTORY[name])
+    try:
+        data = default_settings_dict()
+    except Exception:
+        data = {"advanced": {}}   # RNA not available (unregistered module)
+    adv_overrides = overrides.pop("advanced", {}) if isinstance(overrides, dict) else {}
+    data.update(overrides)
+    data.setdefault("advanced", {}).update(adv_overrides)
+    data["naming"] = naming_block(data)
+    data["fastbake_preset"] = PRESET_VERSION
+    data["name"] = name
+    return data
 
 
 def ensure_factory_presets():
     existing = set(list_presets())
-    for name, overrides in FACTORY.items():
+    for name in FACTORY:
         if name in existing:
             continue
-        data = {"fastbake_preset": PRESET_VERSION, "name": name,
-                "quads": 5000, "tex_size": "2048",
-                "roughness_to_alpha": True, "review_stages": False,
-                "advanced": {}}
-        adv = overrides.pop("advanced", {}) if isinstance(overrides, dict) else {}
-        data.update(overrides)
-        data["advanced"].update(adv)
         with open(_path(name), "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            json.dump(factory_preset_data(name), f, indent=2)
+
+
+def _report_rejected(operator, rejected):
+    if not rejected:
+        return
+    shown = ", ".join(rejected[:4])
+    if len(rejected) > 4:
+        shown += ", ... (%d more)" % (len(rejected) - 4)
+    operator.report({"WARNING"}, "Preset values not applied: " + shown)
 
 
 # bpy requires Python to keep a reference to the strings returned by an
@@ -91,11 +174,20 @@ class FASTBAKE_OT_preset_save(bpy.types.Operator):
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
-        if not self.name.strip():
-            self.report({"ERROR"}, "Preset needs a name")
+        try:
+            stem, existed = save_preset(self.name, context.scene.fastbake)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-        save_preset(self.name, context.scene.fastbake)
-        self.report({"INFO"}, "Saved preset '%s'" % self.name)
+        except OSError as exc:
+            self.report({"ERROR"}, "Could not save preset: %s" % exc)
+            return {"CANCELLED"}
+        if existed:
+            self.report({"WARNING"}, "Replaced preset '%s'" % stem)
+        elif stem != self.name.strip():
+            self.report({"INFO"}, "Saved preset as '%s'" % stem)
+        else:
+            self.report({"INFO"}, "Saved preset '%s'" % stem)
         return {"FINISHED"}
 
 
@@ -115,11 +207,12 @@ class FASTBAKE_OT_preset_load(bpy.types.Operator):
         if self.preset == "NONE":
             return {"CANCELLED"}
         try:
-            load_preset(self.preset, context.scene.fastbake)
+            rejected = load_preset(self.preset, context.scene.fastbake)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self.report({"ERROR"}, "Could not load preset: %s" % exc)
             return {"CANCELLED"}
         self.report({"INFO"}, "Loaded preset '%s'" % self.preset)
+        _report_rejected(self, rejected)
         return {"FINISHED"}
 
 
@@ -139,7 +232,7 @@ class FASTBAKE_OT_preset_delete(bpy.types.Operator):
             return {"CANCELLED"}
         try:
             os.remove(_path(self.preset))
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         return {"FINISHED"}
@@ -159,13 +252,17 @@ class FASTBAKE_OT_preset_export(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
-        data = {"fastbake_preset": PRESET_VERSION, "name": "exported"}
-        data.update(settings_to_dict(context.scene.fastbake))
         path = self.filepath
         if not path.lower().endswith(".json"):
             path += ".json"
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        data = preset_data(os.path.splitext(os.path.basename(path))[0],
+                           context.scene.fastbake)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as exc:
+            self.report({"ERROR"}, "Export failed: %s" % exc)
+            return {"CANCELLED"}
         self.report({"INFO"}, "Exported %s" % os.path.basename(path))
         return {"FINISHED"}
 
@@ -188,13 +285,18 @@ class FASTBAKE_OT_preset_import(bpy.types.Operator):
                 data = json.load(f)
             if data.get("fastbake_preset") != PRESET_VERSION:
                 raise ValueError("Not a FastBake preset")
-            dict_to_settings(data, context.scene.fastbake)
-            name = data.get("name") or os.path.splitext(os.path.basename(self.filepath))[0]
-            save_preset(name, context.scene.fastbake)
+            rejected = dict_to_settings(data, context.scene.fastbake)
+            name = data.get("name") or os.path.splitext(
+                os.path.basename(self.filepath))[0]
+            # store the FILE, not a re-serialization of the scene: anything
+            # this version could not apply stays in the preset instead of
+            # being overwritten with the current value
+            stem, _existed = write_preset_data(name, data)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self.report({"ERROR"}, "Import failed: %s" % exc)
             return {"CANCELLED"}
-        self.report({"INFO"}, "Imported preset '%s'" % name)
+        self.report({"INFO"}, "Imported preset '%s'" % stem)
+        _report_rejected(self, rejected)
         return {"FINISHED"}
 
 

@@ -1,5 +1,10 @@
-# Pack stage: SSAA downscale, roughness -> color-alpha channel packing, and
-# saving the baked textures to the output directory.
+# Pack stage: SSAA downscale, color-alpha channel packing and saving the baked
+# textures to the output directory.
+#
+# Who owns the color texture's alpha channel (plan §2 ruling): the source's own
+# alpha if it has one (bake produced a transient "alpha" map — it is folded in
+# here and its datablock dropped, so no later stage sees it), else roughness if
+# "Roughness to alpha" is on, else Cycles' bake coverage mask.
 #
 # All pixel work is numpy via Image.pixels.foreach_get/foreach_set (orders of
 # magnitude faster than pixels[:]). Synchronous: everything happens in start().
@@ -11,6 +16,13 @@ import numpy as np
 
 from .. import compat
 from .context import Stage, StageError
+
+
+def _image(name):
+    """Local-only image lookup: every name here is one FastBake created, so a
+    library-linked datablock sharing the name must never be picked up (it is
+    read-only — packing or removing it would fail mid-stage)."""
+    return bpy.data.images.get((name, None)) if name else None
 
 
 def _read_pixels(img):
@@ -115,18 +127,55 @@ class PackStage(Stage):
 
         # 1. downscale every SSAA-sized bake to the final resolution
         for key, name in ctx.images.items():
-            img = bpy.data.images.get(name)
+            img = _image(name)
             if img is None:
                 raise StageError("Baked %s image '%s' is missing" % (key, name))
             if img.size[0] > target:
                 _downscale(img, target)
                 ctx.log("downscaled %s to %dx%d" % (img.name, img.size[0], img.size[1]))
 
-        # 2. pack roughness into the color texture's alpha channel
+        # 2. fill the color texture's alpha channel (plan §2 ruling): the
+        #    source's own alpha wins it when there is one, otherwise roughness
+        #    may fold in. Without either, the channel keeps Cycles' coverage
+        #    mask, which is what an opaque asset wants.
         pack = bool(ctx.settings["roughness_to_alpha"]
                     and not ctx.flags.get("source_uses_alpha"))
-        color = bpy.data.images.get(ctx.images.get("color", ""))
-        rough = bpy.data.images.get(ctx.images.get("roughness", ""))
+        color = _image(ctx.images.get("color", ""))
+        rough = _image(ctx.images.get("roughness", ""))
+        alpha = _image(ctx.images.get("alpha", ""))
+        ctx.flags["roughness_packed"] = False
+        ctx.flags["source_alpha_packed"] = False
+
+        if alpha is not None and color is None:
+            ctx.log("pack: color image missing, source alpha dropped")
+        elif alpha is not None and tuple(alpha.size) != tuple(color.size):
+            raise StageError("Alpha map is %dx%d but the color map is %dx%d"
+                             % (alpha.size[0], alpha.size[1],
+                                color.size[0], color.size[1]))
+        elif alpha is not None:
+            color = _ensure_alpha(color)
+            ctx.images["color"] = color.name
+            col = _read_pixels(color)
+            alp = _read_pixels(alpha)
+            # the alpha pass is a grayscale EMIT bake of the source's Alpha
+            # input: its R channel IS the alpha, stored linearly
+            np.clip(alp[0::4], 0.0, 1.0, out=col[3::4])
+            del alp
+            color.pixels.foreach_set(col)
+            del col
+            color.update()
+            color.alpha_mode = "CHANNEL_PACKED"
+            ctx.flags["source_alpha_packed"] = True
+            ctx.log("packed source alpha into color alpha")
+            # close the loop on the preflight notice: the user is told the
+            # roughness moved out, so also tell them what took the channel
+            ctx.notice("The sources' own alpha is stored in the color "
+                       "texture's alpha channel (channel-packed).")
+        if alpha is not None:
+            # transient map: never saved, never handed to the material stage
+            bpy.data.images.remove(alpha)
+            del ctx.images["alpha"]
+
         if pack and color and rough:
             color = _ensure_alpha(color)
             ctx.images["color"] = color.name
@@ -142,12 +191,10 @@ class PackStage(Stage):
             del ctx.images["roughness"]
             ctx.flags["roughness_packed"] = True
             ctx.log("packed roughness into color alpha")
-        else:
-            ctx.flags["roughness_packed"] = False
 
         # 3. save: color/roughness 8-bit PNG, normal 16-bit PNG
         for key, name in ctx.images.items():
-            img = bpy.data.images.get(name)
+            img = _image(name)
             if img is None:
                 raise StageError("Baked %s image '%s' is missing" % (key, name))
             path = os.path.join(out_dir, img.name + ".png")
@@ -163,7 +210,11 @@ class PackStage(Stage):
 
     def summary(self, ctx):
         n = len(ctx.files)
-        note = ", roughness in color alpha" if ctx.flags.get("roughness_packed") else ""
+        note = ""
+        if ctx.flags.get("roughness_packed"):
+            note = ", roughness in color alpha"
+        elif ctx.flags.get("source_alpha_packed"):
+            note = ", source alpha in color alpha"
         return "Saved %d texture%s to %s%s" % (
             n, "s" if n != 1 else "", ctx.output_dir(), note)
 

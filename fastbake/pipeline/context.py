@@ -9,13 +9,49 @@
 # * Raise StageError("user readable message") for expected failures.
 
 import os
+import shutil
 import tempfile
+import time
 
 import bpy
+
+from .. import compat, naming
 
 
 class StageError(Exception):
     """Expected, user-facing pipeline failure."""
+
+
+# Temp/cache lives exclusively under the extension user dir (plan §9 review
+# compliance) — never in the OS temp location.
+_TMP_PREFIX = "run_"
+_TMP_MAX_AGE = 24 * 3600
+
+
+def tmp_root():
+    return compat.extension_user_dir("tmp")
+
+
+def purge_stale_tmpdirs(max_age=_TMP_MAX_AGE):
+    """Remove leftovers of runs that died before teardown (crash, kill).
+
+    Best effort: a missing or unwritable tmp root is not an error.
+    """
+    try:
+        root = tmp_root()
+        entries = os.listdir(root)
+    except Exception:
+        return
+    now = time.time()
+    for entry in entries:
+        if not entry.startswith(_TMP_PREFIX):
+            continue
+        path = os.path.join(root, entry)
+        try:
+            if os.path.isdir(path) and now - os.path.getmtime(path) > max_age:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
 
 
 class PipelineContext:
@@ -41,7 +77,9 @@ class PipelineContext:
         self.undo_hooks = []                   # callables run (in reverse) by driver rollback
                                                # to restore state rollback_to can't (e.g. the
                                                # transforms applied to source originals)
-        self.tmpdir = tempfile.mkdtemp(prefix="fastbake_")
+        # Created on first use only: the BAKE button builds throw-away
+        # contexts (re-bake confirm dialog) that must not litter the disk.
+        self._tmpdir = None
 
     # -- helpers -------------------------------------------------------------
 
@@ -68,14 +106,65 @@ class PipelineContext:
         if mat.name not in self.created_materials:
             self.created_materials.append(mat.name)
 
-    def output_dir(self):
-        raw = self.settings["advanced"]["output_dir"] or "//textures/"
+    # -- temp files ------------------------------------------------------------
+
+    @property
+    def tmpdir(self):
+        """Per-run scratch dir, created on first access (see plan §9)."""
+        if self._tmpdir is None:
+            try:
+                self._tmpdir = tempfile.mkdtemp(prefix=_TMP_PREFIX, dir=tmp_root())
+            except Exception:
+                # unwritable extension dir: a run is still better than a crash
+                self._tmpdir = tempfile.mkdtemp(prefix="fastbake_")
+        return self._tmpdir
+
+    def tmpdir_if_created(self):
+        """The temp dir path, or None when this context never needed one."""
+        return self._tmpdir
+
+    # -- output ---------------------------------------------------------------
+
+    def output_path(self):
+        """Absolute output directory, or None when it cannot be resolved.
+
+        None means an unsaved .blend with a //relative path — the UI asks for
+        a folder (plan §5 stage 0). There is deliberately NO temp-dir
+        fallback: textures the user cannot find are a silent failure.
+        """
+        raw = self.settings.get("advanced", {}).get("output_dir") or "//textures/"
+        if raw.startswith("//") and not bpy.data.filepath:
+            return None
         path = bpy.path.abspath(raw)
         if not path or not os.path.isabs(path):
-            # unsaved .blend with a //relative path: fall back to temp
-            path = os.path.join(self.tmpdir, "textures")
-        os.makedirs(path, exist_ok=True)
+            return None
+        return os.path.normpath(path)
+
+    def output_dir(self, create=True):
+        path = self.output_path()
+        if path is None:
+            raise StageError(
+                "This .blend has never been saved, so //textures/ has no "
+                "location. Save the file or set an output folder in "
+                "Advanced ▸ Output.")
+        if create:
+            os.makedirs(path, exist_ok=True)
         return path
+
+    # -- naming ----------------------------------------------------------------
+    # Single place every stage asks for artifact names, so template/style
+    # settings are honoured uniformly (see naming.py).
+
+    def tex_name(self, key):
+        adv = self.settings.get("advanced", {})
+        return naming.tex_name(self.base, key, self.run,
+                               adv.get("naming_style", "VERBOSE"),
+                               adv.get("naming_template"))
+
+    def mat_name(self):
+        adv = self.settings.get("advanced", {})
+        return naming.mat_name(self.base, self.run,
+                               adv.get("material_template"))
 
     def snapshot_counts(self):
         return (len(self.created_objects), len(self.created_images),

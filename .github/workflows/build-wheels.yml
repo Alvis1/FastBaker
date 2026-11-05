@@ -1,0 +1,166 @@
+# Build the bundled autoremesher_core wheels and package FastBake into
+# per-platform / per-Python extension zips — the "no external dependency"
+# pipeline. FastBake owns this build: it pins a specific upstream commit and
+# controls the compiler flags (notably -march=x86-64-v2, so the wheels run on
+# pre-AVX2 CPUs — upstream shipped 1.0 built for x86-64-v3, which SIGILLs).
+#
+# Trigger manually, or on a tag. Wheels + zips are uploaded as artifacts; the
+# QuadriFlow-only universal zip is still built separately with
+# `blender --command extension build`.
+#
+# Target matrix (plan §9, §12 decision 4): {linux-x64, windows-x64,
+# macos-x64, macos-arm64} x {cp311 for Blender 4.5-5.0, cp312 abi3 for 5.1+}
+# = 8 wheels -> 8 extension zips.
+
+name: build-wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+# The MIT AutoRemesher core (Qt-free) + nanobind binding + scikit-build-core
+# packaging live upstream. Pinned for reproducibility; bump deliberately.
+env:
+  CORE_REPO: jakeblakeley/autoremesher-blender
+  CORE_REF: v1.0.0
+
+jobs:
+  wheels:
+    name: wheels-${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One leg per *architecture*, not per runner OS: cibuildwheel's
+        # default CIBW_ARCHS is "auto" = the runner's native arch only, and
+        # the macOS runners are Apple Silicon, so a single macos leg can
+        # never produce the macos-x64 wheel the plan asks for. Splitting the
+        # legs also lets each one carry the ISA flags that are valid for it.
+        include:
+          - id: linux-x64
+            os: ubuntu-latest
+            archs: x86_64
+            # x86-64-v2 = SSE4.2/POPCNT (Nehalem, 2008). Conservative on
+            # purpose: upstream's own 1.0 build targets x86-64-v3 and
+            # SIGILLs on pre-AVX2 CPUs (upstream issue #33).
+            cibw_env: >-
+              CFLAGS="-march=x86-64-v2 -mtune=generic"
+              CXXFLAGS="-march=x86-64-v2 -mtune=generic"
+
+          - id: windows-x64
+            os: windows-latest
+            archs: AMD64
+            # NO /arch flag on purpose. MSVC's x64 default baseline is SSE2,
+            # which is BELOW x86-64-v2 — i.e. strictly safer than the
+            # baseline we promise, and it still runs everywhere x86-64-v2
+            # does. MSVC has no /arch:SSE4.2 switch, and /arch:AVX would
+            # raise the requirement to Sandy Bridge (AVX is x86-64-v3, not
+            # v2) and SIGILL on the pre-AVX CPUs this build exists to
+            # protect. So: leave /arch unset.
+            cibw_env: ""
+
+          - id: macos-x64
+            # Intel macOS runner image. GitHub retired macos-13 on 2025-12-04
+            # (a job pinned to it queues forever and stalls the package job),
+            # and macos-15-intel is its Intel replacement. When that one is
+            # retired too, cross-compile from the arm64 runner with
+            # archs: x86_64 and CIBW_TEST_SKIP: "*_x86_64" (the wheel can be
+            # built but not imported there).
+            os: macos-15-intel
+            archs: x86_64
+            cibw_env: >-
+              CFLAGS="-march=x86-64-v2 -mtune=generic"
+              CXXFLAGS="-march=x86-64-v2 -mtune=generic"
+
+          - id: macos-arm64
+            os: macos-latest
+            archs: arm64
+            # AArch64 clang rejects an x86 CPU name for -march ("unsupported
+            # argument 'x86-64-v2'"), and arm64 macs have a single fixed
+            # baseline anyway — no ISA flags here.
+            cibw_env: ""
+    steps:
+      - name: Checkout AutoRemesher core (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPO }}
+          ref: ${{ env.CORE_REF }}
+          submodules: recursive
+          fetch-depth: 0
+
+      # NOTE: geogram sets some per-file arch flags of its own; if a pre-AVX2
+      # SIGILL ever resurfaces, also pass a geogram CMake option here via
+      # CIBW_CONFIG_SETTINGS / a geogram cache var. Verified target: no
+      # AVX2/BMI2/FMA in the shipped binaries.
+      - name: Build wheels (cp311 + cp312)
+        uses: pypa/cibuildwheel@v2.21
+        with:
+          output-dir: wheelhouse
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
+          # cp311 = Blender 4.5-5.0 (Python 3.11); cp312 is built as a
+          # stable-ABI (abi3) wheel and loads on Blender 5.1+'s Python 3.13.
+          # Stated explicitly so a pyproject change upstream cannot silently
+          # drop or add a generation the packaging step expects.
+          CIBW_BUILD: "cp311-* cp312-*"
+          CIBW_ENVIRONMENT: ${{ matrix.cibw_env }}
+
+      # dev/package_extension.py ships the cp312 wheel to Blender 5.1+, whose
+      # Python is 3.13 — that only loads if the wheel is stable-ABI. Nothing
+      # else in the repo verifies upstream's abi3 claim, so verify it here
+      # instead of shipping a zip Blender will refuse to install.
+      - name: Verify the cp312 wheels are stable-ABI (abi3)
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          for wheel in wheelhouse/*cp312*.whl; do
+            found=1
+            case "$wheel" in
+              *-abi3-*) echo "ok: $wheel" ;;
+              *) echo "NOT abi3: $wheel — the 5.1+ zip would not load"; exit 1 ;;
+            esac
+          done
+          test "$found" = 1 || { echo "no cp312 wheel was built"; exit 1; }
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.id }}
+          path: wheelhouse/*.whl
+
+  package:
+    name: package extension zips
+    needs: wheels
+    # Package whatever wheels did build: one failing arch leg must not cost
+    # us the zips for the three that succeeded (the missing platforms are
+    # listed as a warning by package_extension.py).
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout FastBake
+        uses: actions/checkout@v4
+
+      - name: Collect all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Package per-platform extension zips
+        run: |
+          python dev/package_extension.py --wheel-dir wheelhouse --python-tag cp311 --out-dir dist
+          python dev/package_extension.py --wheel-dir wheelhouse --python-tag cp312 --out-dir dist
+          ls -la dist
+
+      - name: Upload FastBake extension zips
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastbake-extensions
+          path: dist/fastbake-*.zip

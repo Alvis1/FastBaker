@@ -1,13 +1,17 @@
 # FastBake headless integration smoke test.
 #
-# Run:
-#   /Applications/Blender.app/Contents/MacOS/Blender --background \
-#       --factory-startup --python tests/bl_smoke.py
+# Run (this is exactly what .github/workflows/tests.yml runs, on every
+# supported Blender):
+#   blender --background --factory-startup --python-exit-code 1 \
+#       --python tests/bl_smoke.py
 #
 # Builds a small scene (two overlapping cubes + a ~2k-face UV sphere), runs
 # the full bake pipeline through the driver's blocking path, then the re-bake
 # guard + force path, then the lightmap pipeline. Prints PASS/FAIL per
 # assertion group and exits 1 on any failure.
+#
+# Sibling suites: bl_torture.py (24-mesh merge torture set), bl_uv_bench.py
+# (UV solver vs Smart UV), bl_guard_presets.py (re-bake guard + presets).
 
 import os
 import sys
@@ -132,7 +136,7 @@ def main():
     import fastbake
     fastbake.register()
     from fastbake import naming
-    from fastbake.pipeline import driver, preflight
+    from fastbake.pipeline import driver, merge, preflight
 
     cube_a, cube_b, sphere = build_scene()
     src_names = [cube_a.name, cube_b.name, sphere.name]
@@ -146,8 +150,34 @@ def main():
     assert ctx is not None
     base = ctx.base
     assert base == "SmokeSphere", "unexpected base name: %r" % base
-    launched = driver.launch(bpy.context, driver.build_bake_stages(), ctx)
+    # Watch the merge scaffold on the way past: MergeStage is synchronous, so
+    # the work object exists the moment start() returns, and retopo deletes it
+    # again once consumed. Wrapping the instance keeps the run on the real
+    # driver path. (The full 24-mesh version of this check is bl_torture.py;
+    # this one runs in CI on every supported Blender.)
+    stages = driver.build_bake_stages()
+    merge_stage = next(s for s in stages if s.stage_id == "merge")
+    inner_start = merge_stage.start
+    scaffold = {}
+
+    def spy_start(c):
+        inner_start(c)
+        work = c.obj(c.work_name)
+        scaffold["diag"] = merge._diagnose(work.data) if work is not None else None
+    merge_stage.start = spy_start
+
+    launched = driver.launch(bpy.context, stages, ctx)
     assert launched, "driver.launch refused to start"
+
+    def check_scaffold_watertight():
+        diag = scaffold.get("diag")
+        assert diag is not None, "merge stage produced no work object"
+        assert diag["faces"] > 0, "merge scaffold has no faces"
+        assert diag["boundary"] == 0 and diag["bad"] == 0 and diag["flipped"] == 0, \
+            ("merge scaffold not watertight: %d boundary, %d bad, %d flipped "
+             "edges (%d faces)" % (diag["boundary"], diag["bad"],
+                                   diag["flipped"], diag["faces"]))
+    group("first-run: merge scaffold watertight", check_scaffold_watertight)
 
     def check_result_mesh():
         assert ctx.result_name, "ctx.result_name not set"

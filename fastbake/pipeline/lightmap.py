@@ -8,7 +8,7 @@ import time
 import bpy
 import numpy as np
 
-from .. import compat, naming
+from .. import compat
 from .context import Stage, StageError
 from .state import STATE
 
@@ -56,13 +56,31 @@ class LightmapStage(Stage):
     gate = False
     adjust_props = ("lm_size", "lm_samples", "lm_gamma", "lm_denoise")
 
+    # safe defaults in case cancel()/poll() is reached before start()
+    _done = True
+    _baking = False
+    _cleaned = True
+    _handlers_installed = False
+
     def start(self, ctx):
+        # belt and braces with preflight: the whole stage is a Cycles bake
+        if not compat.cycles_available():
+            raise StageError("Cycles render engine is not available")
         self._done = False
         self._baking = False
         self._cleaned = False
         self._t0 = 0.0
         self._est = 10.0
         self._margin = 4
+        # completion is handler-driven (the same pattern as BakeStage): a
+        # fixed grace period mistakes a job that is still queued behind the
+        # render lock for a finished one
+        self._done_flag = False
+        self._cancel_flag = False
+        self._seen_running = False
+        self._handlers_installed = False
+        self._h_complete = None
+        self._h_cancel = None
         self._restore = {}            # plain values only (never bpy IDs)
         self._sel_prev = None         # object names
         self._act_prev = None
@@ -95,6 +113,7 @@ class LightmapStage(Stage):
                 self._finish(ctx)
                 self._done = True
             else:
+                self._install_handlers()
                 self._bake(lm, invoke=True)
                 self._baking = True
                 self._t0 = time.time()
@@ -104,13 +123,28 @@ class LightmapStage(Stage):
             raise
 
     def poll(self, ctx):
+        try:
+            return self._poll_inner(ctx)
+        except Exception:
+            self._cleanup(ctx)
+            raise
+
+    def _poll_inner(self, ctx):
         if self._done:
             return None
         if self._baking:
+            if self._cancel_flag:
+                raise StageError("Lightmap bake job was cancelled")
             elapsed = time.time() - self._t0
-            # grace period: the bake job may not be registered on the very
-            # first poll after INVOKE_DEFAULT
-            if compat.bake_job_running() or elapsed < 0.5:
+            running = compat.bake_job_running()
+            if running:
+                self._seen_running = True
+            # the job may start suspended (another render-lock job is active),
+            # so "not running" only means done once it was seen running
+            if not (self._done_flag or (self._seen_running and not running
+                                        and elapsed > 1.0)):
+                if not self._seen_running and elapsed > 30.0:
+                    raise StageError("Lightmap bake job failed to start")
                 return min(0.85, 0.85 * elapsed / self._est)
             self._baking = False
         self._done = True
@@ -118,15 +152,12 @@ class LightmapStage(Stage):
         return None
 
     def cancel(self, ctx):
-        if self._baking:
-            # there is no API to abort a running bake job — wait briefly so
-            # cleanup does not pull nodes from under Cycles
-            t0 = time.time()
-            while compat.bake_job_running() and time.time() - t0 < 3.0:
-                time.sleep(0.1)
-            if compat.bake_job_running():
-                ctx.log("lightmap: bake job still running at cancel")
-            self._baking = False
+        # non-blocking by contract: the driver never tears a stage down while
+        # compat.bake_job_running() is True, so cleanup cannot pull nodes out
+        # from under Cycles. Just drop the handlers and restore the scene.
+        if self._baking and compat.bake_job_running():
+            ctx.log("lightmap: cancel requested while the bake job is running")
+        self._baking = False
         self._cleanup(ctx)
 
     def summary(self, ctx):
@@ -152,10 +183,13 @@ class LightmapStage(Stage):
             "filepath": r.filepath,
             "use_compositing": r.use_compositing,
             "use_sequencer": r.use_sequencer,
-            "media_type": getattr(ims, "media_type", None),
-            "file_format": ims.file_format,
-            "color_mode": ims.color_mode,
-            "color_depth": ims.color_depth,
+            # a scene Render Region (View > Render Region / Ctrl+B) and the
+            # stamp overlay would crop / draw over the denoise render, so
+            # _denoise clears them and _cleanup puts them back
+            "use_border": r.use_border,
+            "crop_to_border": getattr(r, "use_crop_to_border", None),
+            "use_stamp": getattr(r, "use_stamp", None),
+            "image_format": compat.image_format_snapshot(ims),
             "camera": scene.camera.name if scene.camera else None,
             "hide_viewport": obj.hide_viewport,
             "hide_eye": obj.hide_get(),
@@ -180,7 +214,7 @@ class LightmapStage(Stage):
         bpy.context.view_layer.objects.active = obj
 
         adv = ctx.settings["advanced"]
-        name = naming.tex_name(ctx.base, "lightmap", ctx.run, adv["naming_style"])
+        name = ctx.tex_name("lightmap")
         img = bpy.data.images.new(name, lm["size"], lm["size"],
                                   alpha=False, float_buffer=True)
         # new float images default to the scene-linear colorspace — keep it
@@ -281,39 +315,15 @@ class LightmapStage(Stage):
 
         # 4.x needs scene.use_nodes flipped on by ensure_compositor_tree;
         # snapshot it first (5.x uses compositing_node_group instead)
-        if not hasattr(scene, "compositing_node_group") and hasattr(scene, "use_nodes"):
-            self._use_nodes_prev = scene.use_nodes
+        self._use_nodes_prev = compat.compositor_use_nodes_snapshot(scene)
 
         tree, created = compat.ensure_compositor_tree(scene)
         self._comp_tree_created = created
 
-        out_node = None
-        for node in tree.nodes:
-            if node.bl_idname == "CompositorNodeComposite":
-                out_node = node
-                break
-        if out_node is None:
-            try:
-                out_node = tree.nodes.new("CompositorNodeComposite")
-                self._comp_nodes.append(out_node.name)
-            except RuntimeError:
-                out_node = None
-        if out_node is None:
-            # 5.1 removed CompositorNodeComposite: the compositor node group
-            # outputs through an interface socket + Group Output node
-            # (verified on 5.1.2; candidate for a compat seam)
-            if not any(getattr(it, "in_out", None) == "OUTPUT"
-                       for it in tree.interface.items_tree):
-                tree.interface.new_socket("Image", in_out="OUTPUT",
-                                          socket_type="NodeSocketColor")
-                self._comp_iface_created = True
-            for node in tree.nodes:
-                if node.bl_idname == "NodeGroupOutput":
-                    out_node = node
-                    break
-            if out_node is None:
-                out_node = tree.nodes.new("NodeGroupOutput")
-                self._comp_nodes.append(out_node.name)
+        # Composite node on 4.x/5.0, interface socket + Group Output on 5.1+
+        out_node, new_nodes, self._comp_iface_created = \
+            compat.ensure_compositor_output(tree)
+        self._comp_nodes.extend(new_nodes)
         out_sock = out_node.inputs.get("Image")
         if out_sock is None and len(out_node.inputs):
             out_sock = out_node.inputs[0]
@@ -346,7 +356,21 @@ class LightmapStage(Stage):
         r.resolution_percentage = 100
         r.use_compositing = True
         r.use_sequencer = False
+        # a leftover Render Region would crop the denoise render (or, with
+        # crop off, leave everything outside the region black) and the stamp
+        # would burn text into the lightmap — both restored by _cleanup
+        r.use_border = False
+        if hasattr(r, "use_crop_to_border"):
+            r.use_crop_to_border = False
+        if hasattr(r, "use_stamp"):
+            r.use_stamp = False
         tmp_path = os.path.join(ctx.tmpdir, "lightmap_denoise.exr")
+        # a redo of this stage reuses the run's tmpdir: drop any earlier file
+        # so a render that writes nothing cannot be read back as this one
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
         r.filepath = tmp_path
         compat.set_image_format(r.image_settings, "OPEN_EXR",
                                 color_depth="32", color_mode="RGBA")
@@ -377,12 +401,42 @@ class LightmapStage(Stage):
         img.pixels.foreach_set(buf)
         img.update()
 
+    # -- handlers -----------------------------------------------------------------
+
+    def _install_handlers(self):
+        stage = self
+
+        def on_complete(*_args):
+            stage._done_flag = True
+
+        def on_cancel(*_args):
+            stage._cancel_flag = True
+
+        self._h_complete = on_complete
+        self._h_cancel = on_cancel
+        _pre, complete, cancel = compat.bake_handlers()
+        complete.append(on_complete)
+        cancel.append(on_cancel)
+        self._handlers_installed = True
+
+    def _remove_handlers(self):
+        if not self._handlers_installed:
+            return
+        _pre, complete, cancel = compat.bake_handlers()
+        for lst, fn in ((complete, self._h_complete), (cancel, self._h_cancel)):
+            try:
+                lst.remove(fn)
+            except ValueError:
+                pass
+        self._handlers_installed = False
+
     # -- restore -----------------------------------------------------------------
 
     def _cleanup(self, ctx):
         if self._cleaned:
             return
         self._cleaned = True
+        self._remove_handlers()
         scene = bpy.context.scene
         obj = ctx.obj(self._obj_name)
 
@@ -437,20 +491,14 @@ class LightmapStage(Stage):
             tree = compat.get_compositor_tree(scene)
             if tree:
                 if self._comp_tree_created:
-                    if hasattr(scene, "compositing_node_group"):
-                        scene.compositing_node_group = None
-                    bpy.data.node_groups.remove(tree)
+                    compat.discard_compositor_tree(scene, tree)
                 else:
                     for name in self._comp_nodes:
                         node = tree.nodes.get(name)
                         if node:
                             tree.nodes.remove(node)
                     if self._comp_iface_created:
-                        for item in list(tree.interface.items_tree):
-                            if (getattr(item, "name", "") == "Image"
-                                    and getattr(item, "in_out", "") == "OUTPUT"):
-                                tree.interface.remove(item)
-                                break
+                        compat.remove_compositor_output_socket(tree)
                     if self._comp_restore_link:
                         to_name, to_sock, from_name, from_sock = self._comp_restore_link
                         to_node = tree.nodes.get(to_name)
@@ -464,11 +512,7 @@ class LightmapStage(Stage):
                                 tree.links.new(fs, ts)
         except Exception as exc:
             ctx.log("lightmap cleanup (compositor): %s" % exc)
-        if self._use_nodes_prev is not None and hasattr(scene, "use_nodes"):
-            try:
-                scene.use_nodes = self._use_nodes_prev
-            except Exception:
-                pass
+        compat.restore_compositor_use_nodes(scene, self._use_nodes_prev)
 
         # render settings
         rs = self._restore
@@ -484,12 +528,12 @@ class LightmapStage(Stage):
                 r.filepath = rs["filepath"]
                 r.use_compositing = rs["use_compositing"]
                 r.use_sequencer = rs["use_sequencer"]
-                ims = r.image_settings
-                if rs["media_type"] is not None and hasattr(ims, "media_type"):
-                    ims.media_type = rs["media_type"]  # must precede file_format on 5.x
-                ims.file_format = rs["file_format"]
-                ims.color_mode = rs["color_mode"]
-                ims.color_depth = rs["color_depth"]
+                r.use_border = rs["use_border"]
+                if rs["crop_to_border"] is not None:
+                    r.use_crop_to_border = rs["crop_to_border"]
+                if rs["use_stamp"] is not None:
+                    r.use_stamp = rs["use_stamp"]
+                compat.restore_image_format(r.image_settings, rs["image_format"])
             except Exception as exc:
                 ctx.log("lightmap cleanup (render settings): %s" % exc)
 
