@@ -11,7 +11,7 @@ Supported Blender releases: **4.5 LTS, 5.0, 5.1, 5.2**. Every one of them is exe
 Two kinds of build:
 
 - **Universal (`fastbake-0.2.1.zip` in `dist/`)** — works on every platform with **no external dependencies**. On its own it retopologises with Blender's built-in QuadriFlow; add the AutoRemesher extension (below) to get AutoRemesher.
-- **Platform builds (`fastbake-<ver>[-blender45]-<platform>.zip`, from CI)** — bundle the `autoremesher_core` wheel, so retopology uses AutoRemesher **with no separate install and no Qt**. Pick the zip matching your OS and Blender (the `-blender45` marker = Blender 4.5–5.0 / Python 3.11; the unmarked one = Blender 5.1+ / Python 3.13).
+- **Platform builds (`fastbake-<ver>[-blender45]-<platform>.zip` in `dist/`, built by CI)** — bundle the `autoremesher_core` wheel, so retopology uses AutoRemesher **with no separate install and no Qt**. Pick the zip matching your OS and Blender (the `-blender45` marker = Blender 4.5–5.0 / Python 3.11; the unmarked one = Blender 5.1+ / Python 3.13).
 
 Platform zips are built for `windows_x64`, `linux_x64`, `macos_x64` and `macos_arm64`.
 
