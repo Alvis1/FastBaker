@@ -69,9 +69,15 @@ jobs:
             # built but not imported there).
             os: macos-15-intel
             archs: x86_64
+            # cibuildwheel targets macOS 10.9 on x86_64 by default, and
+            # nanobind's aligned new/delete need 10.13 ("aligned allocation
+            # function ... is only available on macOS 10.13 or newer").
+            # Every Blender FastBake supports (4.5+) needs macOS 11.2 anyway,
+            # so target 11.0 like the arm64 wheel.
             cibw_env: >-
               CFLAGS="-march=x86-64-v2 -mtune=generic"
               CXXFLAGS="-march=x86-64-v2 -mtune=generic"
+              MACOSX_DEPLOYMENT_TARGET=11.0
 
           - id: macos-arm64
             os: macos-latest
